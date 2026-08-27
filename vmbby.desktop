@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vmbby
+Comment=Ethan's Arch Wayland Ubuntu VM controller
+Exec=vmbby gui
+Icon=vmbby
+Terminal=false
+Categories=System;Emulator;
