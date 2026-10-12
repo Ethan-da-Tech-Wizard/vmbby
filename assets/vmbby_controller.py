@@ -72,7 +72,7 @@ class Portal(Gtk.DrawingArea):
 
         title = "vmbby"
         subtitle = "Arch host | Plasma/Hyprland Wayland | Ubuntu guest"
-        cr.select_font_face("Sans", 0, 900)
+        cr.select_font_face("Sans", 0, 1)
         cr.set_font_size(68)
         ext = cr.text_extents(title)
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.55)
@@ -82,7 +82,7 @@ class Portal(Gtk.DrawingArea):
         cr.move_to(cx - ext.width / 2, cy + 16)
         cr.show_text(title)
 
-        cr.select_font_face("Monospace", 0, 700)
+        cr.select_font_face("Monospace", 0, 1)
         cr.set_font_size(15)
         ext = cr.text_extents(subtitle)
         cr.set_source_rgb(0.70, 1.0, 0.94)
