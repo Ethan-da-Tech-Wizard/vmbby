@@ -413,7 +413,7 @@ Disk:
 
 Networking:
   User-mode NAT gives Ubuntu outbound internet without bridge setup. It is
-  simple and low-risk for school work.
+  simple and low-risk for everyday work.
 
 Wayland:
   Plasma and Hyprland are just presenting the windows. They do not create the

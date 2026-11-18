@@ -99,7 +99,7 @@ $XDG_RUNTIME_DIR/vmbby/
 ## Visual Design
 
 The acid-trip visuals belong to the controller, not the Ubuntu guest. That keeps
-school work normal and keeps resource use sane. The controller uses GTK4 and a
+everyday work normal and keeps resource use sane. The controller uses GTK4 and a
 small Cairo drawing loop instead of Electron.
 
 ## Roast-Proof One-Liner
