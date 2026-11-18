@@ -1,3 +1,12 @@
+// ==============================================================================
+// Program: main.rs
+// Programmer: Ethan-da-Tech-Wizard
+// Last Modified: November 18, 2026
+// Purpose: Core Rust CLI engine and hypervisor orchestrator for VMBby.
+//          Interacts with QEMU/KVM via QMP (QEMU Machine Protocol) unix sockets,
+//          manages copy-on-write qcow2 disk overlays, allocates vCPUs and RAM,
+//          and handles graceful guest shutdown and hardware health diagnostics.
+// ==============================================================================
 use std::env;
 use std::ffi::OsString;
 use std::fs;

@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+
+# ==============================================================================
+# Program: vmbby_controller.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Native GTK4/Libadwaita graphical control panel for VMBby virtual machines.
+#          Provides responsive desktop controls for starting, stopping, monitoring,
+#          and viewing real-time memory/CPU usage metrics of QEMU/KVM virtual machines.
+# ==============================================================================
 """GTK4 controller for vmbby.
 
 The Rust binary owns VM behavior. This helper gives the project a custom,

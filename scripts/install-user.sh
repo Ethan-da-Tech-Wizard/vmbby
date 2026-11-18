@@ -1,4 +1,12 @@
 #!/usr/bin/env sh
+
+# ==============================================================================
+# Program: install-user.sh
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: User-level installation script deploying the compiled VMBby Rust binary,
+#          Python GTK4 controller, desktop launcher icon, and XDG desktop entry.
+# ==============================================================================
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
