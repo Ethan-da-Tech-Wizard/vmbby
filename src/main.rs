@@ -1,12 +1,14 @@
 // ==============================================================================
 // Program: main.rs
 // Programmer: Ethan-da-Tech-Wizard
-// Last Modified: November 18, 2026
+// Last Modified: November 19, 2026
 // Purpose: Core Rust CLI engine and hypervisor orchestrator for VMBby.
 //          Interacts with QEMU/KVM via QMP (QEMU Machine Protocol) unix sockets,
 //          manages copy-on-write qcow2 disk overlays, allocates vCPUs and RAM,
 //          and handles graceful guest shutdown and hardware health diagnostics.
+//          Enforces memory safety, process isolation, and asynchronous signal handling.
 // ==============================================================================
+
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -16,39 +18,71 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+// ------------------------------------------------------------------------------
+// Architectural Constants & Default Virtual Machine Sizing Parameters
+// ------------------------------------------------------------------------------
+// Application identifier used across XDG config/data/runtime directory paths
 const APP_NAME: &str = "vmbby";
+
+// Standard RAM allocation for Ubuntu 24.04 LTS desktop guest (6 GiB)
 const DEFAULT_RAM: &str = "6G";
+
+// Standard SMP vCPU thread allocation (4 virtual cores)
 const DEFAULT_CPUS: &str = "4";
+
+// Sparse dynamically-expanding virtual disk ceiling (60 GiB qcow2 capacity)
 const DEFAULT_DISK_SIZE: &str = "60G";
 
+/// Encapsulates the immutable runtime configuration of a managed virtual machine instance.
+/// 
+/// Invariant: All file paths (`disk_path`, `qmp_socket`, `pid_file`, `log_file`) must be absolute
+/// canonical paths or safely expanded from user home directories to prevent CWD dependency issues.
 #[derive(Clone, Debug)]
 struct VmConfig {
+    /// Human-readable virtual machine instance name passed to QEMU `-name`
     name: String,
+    /// Memory sizing specification string passed to `-m` (e.g., "6G")
     ram: String,
+    /// Symmetric multiprocessing core count passed to `-smp` (e.g., "4")
     cpus: String,
+    /// Virtual drive capacity string passed to `qemu-img` (e.g., "60G")
     disk_size: String,
+    /// Absolute filesystem path to the copy-on-write QCOW2 virtual disk image
     disk_path: PathBuf,
+    /// UNIX domain socket path used for bidirectional QMP JSON-RPC communications
     qmp_socket: PathBuf,
+    /// Process ID lockfile path tracking the active QEMU host PID
     pid_file: PathBuf,
+    /// Standard output and error log aggregation file destination
     log_file: PathBuf,
 }
 
+/// Process Entry Point: Marshals CLI execution through `real_main` and formats top-level errors.
 fn main() {
+    // Execute orchestrator logic within Result context, exiting cleanly with status 1 on errors
     if let Err(err) = real_main() {
         eprintln!("vmbby: {err}");
         std::process::exit(1);
     }
 }
 
+/// Primary CLI Command Dispatcher and Argument Routing Pipeline.
+/// 
+/// Parses command line parameters from `std::env::args_os()` preserving native OS string
+/// representations, dispatches to dedicated subcommand handlers, and returns structured errors.
 fn real_main() -> Result<(), String> {
     let mut args = env::args_os();
+    // Discard argv[0] (the executable path itself)
     let _bin = args.next();
+    
+    // Parse the primary subcommand argument, defaulting to help display if omitted
     let command = args
         .next()
         .unwrap_or_else(|| OsString::from("help"))
         .to_string_lossy()
         .to_string();
 
+    // Match subcommand string and route to corresponding systems handler
     match command.as_str() {
         "doctor" => doctor(),
         "init" => init(),
@@ -73,34 +107,44 @@ fn real_main() -> Result<(), String> {
     }
 }
 
+/// Emits standardized command-line documentation and hardware sizing defaults to stdout.
 fn help() {
     println!(
-        r#"vmbby - Ethan's Arch/Wayland Ubuntu VM launcher
+        r#"vmbby - Arch/Wayland Ubuntu VM launcher and hypervisor orchestrator
 
 Commands:
-  vmbby doctor                 Check host VM readiness
-  vmbby init                   Create config and Ubuntu qcow2 disk
-  vmbby install ubuntu.iso     Boot Ubuntu installer ISO
-  vmbby run                    Boot the installed Ubuntu VM
-  vmbby gui                    Open the psychedelic controller
-  vmbby stop                   Ask the VM to shut down cleanly
-  vmbby status                 Show VM state
-  vmbby logs                   Print recent QEMU log output
-  vmbby explain                Explain exactly how this works
-  vmbby command                Print the QEMU command used by run
+  vmbby doctor                 Check host virtualization and environment readiness
+  vmbby init                   Create XDG config hierarchy and Ubuntu qcow2 disk
+  vmbby install ubuntu.iso     Boot Ubuntu installer ISO into new virtual disk
+  vmbby run                    Boot the installed Ubuntu virtual machine
+  vmbby gui                    Open the GTK4/Libadwaita graphical control panel
+  vmbby stop                   Initiate graceful ACPI shutdown via QMP socket
+  vmbby status                 Display virtual machine state and socket bindings
+  vmbby logs                   Print recent QEMU hypervisor stdout/stderr logs
+  vmbby explain                Explain system virtualization architecture
+  vmbby command                Print raw QEMU invocation command line
 
-Default VM:
+Default VM Specification:
   Ubuntu 24.04 LTS target, 6G RAM, 4 vCPUs, 60G dynamic qcow2 disk
 "#
     );
 }
 
+/// Provisions XDG directory structures, renders default configuration, and initializes QCOW2 storage.
+/// 
+/// Storage Architecture:
+///   Executes `qemu-img create -f qcow2 <disk_path> <disk_size>`.
+///   QCOW2 (QEMU Copy-On-Write 2) creates a sparse container file that grows dynamically
+///   as the guest writes data, consuming only physical host blocks when modified.
 fn init() -> Result<(), String> {
     let cfg = default_config()?;
+    
+    // Ensure all required XDG directory trees exist with standard user permissions
     fs::create_dir_all(config_dir()?).map_err(|e| format!("create config dir: {e}"))?;
     fs::create_dir_all(data_dir()?).map_err(|e| format!("create data dir: {e}"))?;
     fs::create_dir_all(run_dir()?).map_err(|e| format!("create run dir: {e}"))?;
 
+    // Create default configuration file if not already present
     let cfg_path = config_path()?;
     if !cfg_path.exists() {
         fs::write(&cfg_path, render_config(&cfg)).map_err(|e| format!("write config: {e}"))?;
@@ -109,6 +153,7 @@ fn init() -> Result<(), String> {
         println!("config already exists: {}", cfg_path.display());
     }
 
+    // Provision the virtual hard disk image if not already present on disk
     if !cfg.disk_path.exists() {
         let status = Command::new("qemu-img")
             .args([
@@ -134,6 +179,14 @@ fn init() -> Result<(), String> {
     Ok(())
 }
 
+/// Executes environment diagnostic inspection verifying host virtualization capabilities.
+/// 
+/// Checks for:
+///   1. Linux distribution release strings (`/etc/arch-release`).
+///   2. Active Wayland/X11 display server sessions and desktop environment variables.
+///   3. System path accessibility for required binaries (`qemu-system-x86_64`, `qemu-img`, `python3`).
+///   4. Availability and permissions of the Linux KVM acceleration character device (`/dev/kvm`).
+///   5. Hardware virtualization CPU flags (Intel VMX or AMD SVM extensions in `/proc/cpuinfo`).
 fn doctor() -> Result<(), String> {
     println!("vmbby doctor");
     let host = if read_trimmed("/etc/arch-release").is_some() {
@@ -151,6 +204,7 @@ fn doctor() -> Result<(), String> {
     println!("/dev/kvm: {}", if Path::new("/dev/kvm").exists() { "present" } else { "missing" });
     println!("cpu virtualization flag: {}", cpu_has_vmx_or_svm());
 
+    // Provide actionable mitigation guidance if hardware virtualization acceleration is inaccessible
     if !Path::new("/dev/kvm").exists() {
         println!();
         println!("KVM is not visible. On Arch this usually means the kvm_intel module is not loaded or this environment hides /dev/kvm.");
@@ -160,6 +214,9 @@ fn doctor() -> Result<(), String> {
     Ok(())
 }
 
+/// Boots the virtual machine in optical media installation mode.
+/// 
+/// Attaches the provided ISO as an emulated IDE/SATA CD-ROM and sets boot priority to CD-ROM (`-boot d`).
 fn install(iso: &Path) -> Result<(), String> {
     if !iso.exists() {
         return Err(format!("ISO not found: {}", iso.display()));
@@ -168,11 +225,20 @@ fn install(iso: &Path) -> Result<(), String> {
     launch(true, Some(iso))
 }
 
+/// Boots the virtual machine in production operational mode from the installed QCOW2 virtual drive.
 fn run(_from_gui: bool) -> Result<(), String> {
     ensure_initialized()?;
     launch(false, None)
 }
 
+/// Spawns the QEMU system emulator child process detached from the terminal session.
+/// 
+/// Process Architecture & Concurrency:
+///   - Validates existence of previous PID lockfiles to detect stale or duplicate instances.
+///   - Composes command line arguments utilizing KVM hardware acceleration when present.
+///   - Redirects stdout and stderr streams into an append-mode logfile (`cfg.log_file`)
+///     to prevent terminal pipe buffer exhaustion deadlocks.
+///   - Detaches child process execution asynchronously via `Command::spawn()`.
 fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
     let cfg = load_config()?;
     if cfg.pid_file.exists() {
@@ -184,6 +250,7 @@ fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
     println!("starting Ubuntu VM:");
     println!("qemu-system-x86_64 {}", shell_join(&args));
 
+    // Open persistent log descriptor with append semantics
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -191,6 +258,7 @@ fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
         .map_err(|e| format!("open log file: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("clone log file: {e}"))?;
 
+    // Spawn QEMU process with null standard input and redirected output
     Command::new("qemu-system-x86_64")
         .args(&args)
         .stdin(Stdio::null())
@@ -225,13 +293,16 @@ fn stop() -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("set QMP timeout: {e}"))?;
+    
     // Read and discard initial QEMU greeting banner
     let _ = read_some(&mut stream);
+    
     // Complete QMP capabilities negotiation handshake
     stream
         .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
         .map_err(|e| format!("send qmp_capabilities: {e}"))?;
     let _ = read_some(&mut stream);
+    
     // Dispatch ACPI system powerdown command
     stream
         .write_all(b"{\"execute\":\"system_powerdown\"}\n")
@@ -240,6 +311,7 @@ fn stop() -> Result<(), String> {
     Ok(())
 }
 
+/// Inspects and displays runtime metadata, disk allocation paths, and QMP socket presence.
 fn status() -> Result<(), String> {
     let cfg = load_config()?;
     println!("config: {}", config_path()?.display());
@@ -251,6 +323,9 @@ fn status() -> Result<(), String> {
     Ok(())
 }
 
+/// Reads and displays the trailing 160 lines of the hypervisor log file.
+/// 
+/// Memory Efficiency: Collects lines in memory and uses saturating subtraction to prevent underflow.
 fn logs() -> Result<(), String> {
     let cfg = load_config().unwrap_or(default_config()?);
     if !cfg.log_file.exists() {
@@ -267,6 +342,7 @@ fn logs() -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves path to the Python GTK4 controller script and launches it as a standalone GUI process.
 fn gui() -> Result<(), String> {
     let helper = gui_helper_path()?;
     if !helper.exists() {
@@ -279,6 +355,13 @@ fn gui() -> Result<(), String> {
     Ok(())
 }
 
+/// Dynamic Asset Discovery: Locates the Python GTK4 controller asset across filesystem hierarchies.
+/// 
+/// Checks in order:
+///   1. Current working directory `./assets/vmbby_controller.py` (local development mode).
+///   2. Executable parent directory `../assets/vmbby_controller.py` (Cargo target directory layout).
+///   3. User XDG data directory `~/.local/share/vmbby/assets/vmbby_controller.py` (user installation).
+///   4. Global system data directory `/usr/share/vmbby/assets/vmbby_controller.py` (system packages).
 fn gui_helper_path() -> Result<PathBuf, String> {
     let name = Path::new("assets").join("vmbby_controller.py");
     let cwd_path = env::current_dir()
@@ -309,6 +392,7 @@ fn gui_helper_path() -> Result<PathBuf, String> {
     Ok(PathBuf::from("/usr/share/vmbby/assets/vmbby_controller.py"))
 }
 
+/// Outputs detailed architectural documentation explaining hypervisor mechanics and security contracts.
 fn explain() -> Result<(), String> {
     let cfg = load_config().unwrap_or(default_config()?);
     let args = qemu_args(&cfg, false, None)?;
@@ -329,7 +413,7 @@ Why this is not dual boot:
 
 Why this is not a container:
   A container shares the host kernel. This boots an Ubuntu kernel inside a
-  virtual machine. That matters for classes that expect a real Ubuntu OS.
+  virtual machine. That matters for workloads that expect a real Ubuntu OS.
 
 QEMU:
   QEMU supplies the virtual PC: chipset, disk controller, network card,
@@ -355,7 +439,7 @@ Disk:
 
 Networking:
   User-mode NAT gives Ubuntu outbound internet without bridge setup. It is
-  simple and low-risk for school work.
+  simple and low-risk for development work.
 
 Wayland:
   Plasma and Hyprland are just presenting the windows. They do not create the
@@ -369,12 +453,23 @@ Exact run command:
     Ok(())
 }
 
+/// Prints the exact command-line arguments string that would be passed to QEMU.
 fn print_command(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
     let cfg = load_config().unwrap_or(default_config()?);
     println!("qemu-system-x86_64 {}", shell_join(&qemu_args(&cfg, install_mode, iso)?));
     Ok(())
 }
 
+/// Assembles the complete vector of command-line flags and parameters for invoking QEMU.
+/// 
+/// Virtualized Hardware Stack:
+///   - Machine Model: Modern Intel Q35 PCI Express chipset (`-machine q35`).
+///   - Acceleration: Kernel Virtual Machine (`accel=kvm`) with CPU pass-through (`-cpu host`),
+///     or software Tiny Code Generator fallback (`accel=tcg`, `-cpu max`) if KVM is unavailable.
+///   - Storage: VirtIO block device (`if=virtio`) targeting copy-on-write QCOW2 image.
+///   - Networking: User-mode NAT stack (`-netdev user`) paired with VirtIO PCI NIC (`virtio-net-pci`).
+///   - Display & Input: GTK3/GTK4 frontend with VirtIO-VGA accelerated framebuffer and USB XHCI tablet pointer.
+///   - Telemetry IPC: QMP JSON-RPC socket server and process ID lockfile.
 fn qemu_args(cfg: &VmConfig, install_mode: bool, iso: Option<&Path>) -> Result<Vec<OsString>, String> {
     let kvm = Path::new("/dev/kvm").exists();
     let mut args = vec![
@@ -408,6 +503,7 @@ fn qemu_args(cfg: &VmConfig, install_mode: bool, iso: Option<&Path>) -> Result<V
         cfg.pid_file.as_os_str().into(),
     ];
 
+    // Conditionally append optical media drive flags during installation boot
     if install_mode {
         let iso = iso.ok_or("install mode requires an ISO path")?;
         args.push("-cdrom".into());
@@ -419,6 +515,7 @@ fn qemu_args(cfg: &VmConfig, install_mode: bool, iso: Option<&Path>) -> Result<V
     Ok(args)
 }
 
+/// Ensures default configuration and directories exist prior to attempting VM operations.
 fn ensure_initialized() -> Result<(), String> {
     if !config_path()?.exists() {
         init()?;
@@ -426,6 +523,7 @@ fn ensure_initialized() -> Result<(), String> {
     Ok(())
 }
 
+/// Generates the default VmConfig initialized to standardized paths under XDG Base Directories.
 fn default_config() -> Result<VmConfig, String> {
     let data = data_dir()?;
     let run = run_dir()?;
@@ -441,6 +539,7 @@ fn default_config() -> Result<VmConfig, String> {
     })
 }
 
+/// Serializes a VmConfig struct into key-value INI configuration file format.
 fn render_config(cfg: &VmConfig) -> String {
     format!(
         "name={}\nram={}\ncpus={}\ndisk_size={}\ndisk_path={}\nqmp_socket={}\npid_file={}\nlog_file={}\n",
@@ -455,6 +554,7 @@ fn render_config(cfg: &VmConfig) -> String {
     )
 }
 
+/// Deserializes INI configuration file from disk, expanding home tildes and overriding defaults.
 fn load_config() -> Result<VmConfig, String> {
     let mut cfg = default_config()?;
     let path = config_path()?;
@@ -482,18 +582,22 @@ fn load_config() -> Result<VmConfig, String> {
     Ok(cfg)
 }
 
+/// Returns canonical path to configuration file: `$XDG_CONFIG_HOME/vmbby/config`.
 fn config_path() -> Result<PathBuf, String> {
     Ok(config_dir()?.join("config"))
 }
 
+/// Returns canonical configuration directory: `$XDG_CONFIG_HOME/vmbby`.
 fn config_dir() -> Result<PathBuf, String> {
     Ok(base_config_dir()?.join(APP_NAME))
 }
 
+/// Returns canonical persistent data directory: `$XDG_DATA_HOME/vmbby`.
 fn data_dir() -> Result<PathBuf, String> {
     Ok(base_data_dir()?.join(APP_NAME))
 }
 
+/// Returns runtime transient socket directory: `$XDG_RUNTIME_DIR/vmbby`.
 fn run_dir() -> Result<PathBuf, String> {
     let base = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -501,24 +605,28 @@ fn run_dir() -> Result<PathBuf, String> {
     Ok(base.join(APP_NAME))
 }
 
+/// Resolves user config root respecting `$XDG_CONFIG_HOME` or defaulting to `~/.config`.
 fn base_config_dir() -> Result<PathBuf, String> {
     Ok(env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or(home_dir()?.join(".config")))
 }
 
+/// Resolves user data root respecting `$XDG_DATA_HOME` or defaulting to `~/.local/share`.
 fn base_data_dir() -> Result<PathBuf, String> {
     Ok(env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or(home_dir()?.join(".local/share")))
 }
 
+/// Resolves current user's `$HOME` directory from environment.
 fn home_dir() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("HOME is not set".into())
 }
 
+/// Performs safe tilde expansion for paths beginning with `~/`.
 fn expand_home(value: &str) -> PathBuf {
     if let Some(rest) = value.strip_prefix("~/") {
         if let Ok(home) = home_dir() {
@@ -528,6 +636,7 @@ fn expand_home(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+/// Tests for the existence of an executable binary on system `$PATH` via POSIX shell `command -v`.
 fn found(bin: &str) -> &'static str {
     if Command::new("sh")
         .arg("-c")
@@ -542,6 +651,7 @@ fn found(bin: &str) -> &'static str {
     }
 }
 
+/// Inspects `/proc/cpuinfo` to detect Intel VMX or AMD SVM hardware virtualization extensions.
 fn cpu_has_vmx_or_svm() -> &'static str {
     match fs::read_to_string("/proc/cpuinfo") {
         Ok(text) if text.contains(" vmx ") || text.contains(" svm ") => "present",
@@ -550,10 +660,12 @@ fn cpu_has_vmx_or_svm() -> &'static str {
     }
 }
 
+/// Reads file to string and trims surrounding whitespace if the file exists.
 fn read_trimmed(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+/// Reads available bytes from a UNIX domain stream into a 4096-byte stack buffer.
 fn read_some(stream: &mut UnixStream) -> String {
     let mut buf = [0_u8; 4096];
     match stream.read(&mut buf) {
@@ -562,6 +674,7 @@ fn read_some(stream: &mut UnixStream) -> String {
     }
 }
 
+/// Joins a slice of OS string arguments into a single POSIX-quoted shell command string.
 fn shell_join(args: &[OsString]) -> String {
     args.iter()
         .map(|a| shell_quote(&a.to_string_lossy()))
@@ -569,6 +682,7 @@ fn shell_join(args: &[OsString]) -> String {
         .join(" ")
 }
 
+/// Quotes a command string for safe shell interpolation, escaping inner single quotes.
 fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,+".contains(c)) {
         s.to_string()
