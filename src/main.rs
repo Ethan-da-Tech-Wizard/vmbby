@@ -203,6 +203,18 @@ fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
+/// Signals the guest virtual machine to initiate a graceful operating system shutdown.
+/// 
+/// QMP (QEMU Machine Protocol) Architecture:
+///   1. Connects to the local UNIX domain socket exposed by the QEMU instance (`cfg.qmp_socket`).
+///   2. Capability Negotiation Handshake:
+///      Upon connection, QEMU sends a greeting banner. The client must reply with
+///      `{"execute": "qmp_capabilities"}` before QEMU accepts operational commands.
+///   3. ACPI Powerdown Injection:
+///      Issues `{"execute": "system_powerdown"}`, which instructs the virtualized
+///      ACPI chipset to assert an ACPI power button event in the guest kernel.
+///      The guest OS (e.g. systemd inside Ubuntu) handles this via `systemd-logind`
+///      to flush disk buffers, terminate services gracefully, and power off without data loss.
 fn stop() -> Result<(), String> {
     let cfg = load_config()?;
     if !cfg.qmp_socket.exists() {
@@ -213,11 +225,14 @@ fn stop() -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("set QMP timeout: {e}"))?;
+    // Read and discard initial QEMU greeting banner
     let _ = read_some(&mut stream);
+    // Complete QMP capabilities negotiation handshake
     stream
         .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
         .map_err(|e| format!("send qmp_capabilities: {e}"))?;
     let _ = read_some(&mut stream);
+    // Dispatch ACPI system powerdown command
     stream
         .write_all(b"{\"execute\":\"system_powerdown\"}\n")
         .map_err(|e| format!("send system_powerdown: {e}"))?;
