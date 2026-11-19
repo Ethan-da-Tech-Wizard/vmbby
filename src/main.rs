@@ -9,6 +9,20 @@
 //          Enforces memory safety, process isolation, and asynchronous signal handling.
 // ==============================================================================
 
+// How this file fits the whole app: vmbby is a single-binary CLI. This file owns every subcommand
+// (`doctor`, `init`, `install`, `run`, `gui`, `stop`, `status`, `logs`, `explain`, `command`). It shells
+// out to `qemu-system-x86_64` and `qemu-img`, talks QMP over a UNIX socket to stop the guest, and
+// starts `assets/vmbby_controller.py` (a Python GTK4 panel) for `vmbby gui`. No crates are used, so
+// the whole dependency surface is the Rust standard library plus the host's QEMU install.
+//
+// Inputs/outputs: argv subcommand in; human-readable text on stdout, errors on stderr with exit
+// code 1. Persistent state lives only in XDG dirs: config file, qcow2 disk, log file, and (runtime
+// dir) the QMP socket and QEMU pid file. Every fallible helper returns `Result<_, String>` so
+// messages reach the user unchanged.
+//
+// Known limits: Linux only (uses /dev/kvm, /proc/cpuinfo, UNIX sockets); no automated tests (the
+// behaviour depends on a real QEMU); `vmbby stop` fires and forgets (it does not wait for the guest
+// to actually power off). Run `vmbby doctor` first on a new machine.
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -71,6 +85,7 @@ fn main() {
 /// Parses command line parameters from `std::env::args_os()` preserving native OS string
 /// representations, dispatches to dedicated subcommand handlers, and returns structured errors.
 fn real_main() -> Result<(), String> {
+    // args_os (not args) so a non-UTF-8 ISO path still reaches `install` unchanged.
     let mut args = env::args_os();
     // Discard argv[0] (the executable path itself)
     let _bin = args.next();
@@ -81,28 +96,33 @@ fn real_main() -> Result<(), String> {
         .unwrap_or_else(|| OsString::from("help"))
         .to_string_lossy()
         .to_string();
+    // The subcommand name itself is plain ASCII, so a lossy conversion is safe here.
 
     // Match subcommand string and route to corresponding systems handler
     match command.as_str() {
         "doctor" => doctor(),
         "init" => init(),
         "install" => {
+            // `install` is the only subcommand with a required positional argument.
             let iso = args
                 .next()
                 .ok_or("usage: vmbby install /path/to/ubuntu.iso")?;
             install(Path::new(&iso))
         }
         "run" => run(false),
+        // "portal" is kept as an alias so older docs and shortcuts still work.
         "gui" | "portal" => gui(),
         "stop" => stop(),
         "status" => status(),
         "logs" => logs(),
         "explain" => explain(),
+        // Prints the run-mode command only; the install-mode command needs an ISO path, so it is not offered here.
         "command" => print_command(false, None),
         "help" | "--help" | "-h" => {
             help();
             Ok(())
         }
+        // Unknown words are an error (exit 1) rather than silently showing help, so scripts notice typos.
         other => Err(format!("unknown command '{other}'. Try: vmbby help")),
     }
 }
@@ -137,6 +157,7 @@ Default VM Specification:
 ///   QCOW2 (QEMU Copy-On-Write 2) creates a sparse container file that grows dynamically
 ///   as the guest writes data, consuming only physical host blocks when modified.
 fn init() -> Result<(), String> {
+    // Defaults, not load_config(): init must work before any config file exists.
     let cfg = default_config()?;
     
     // Ensure all required XDG directory trees exist with standard user permissions
@@ -144,7 +165,8 @@ fn init() -> Result<(), String> {
     fs::create_dir_all(data_dir()?).map_err(|e| format!("create data dir: {e}"))?;
     fs::create_dir_all(run_dir()?).map_err(|e| format!("create run dir: {e}"))?;
 
-    // Create default configuration file if not already present
+    // Never overwrite an existing config: the user may have edited RAM/CPU values, and `init` is
+    // safe to re-run (also called automatically by ensure_initialized).
     let cfg_path = config_path()?;
     if !cfg_path.exists() {
         fs::write(&cfg_path, render_config(&cfg)).map_err(|e| format!("write config: {e}"))?;
@@ -153,7 +175,7 @@ fn init() -> Result<(), String> {
         println!("config already exists: {}", cfg_path.display());
     }
 
-    // Provision the virtual hard disk image if not already present on disk
+    // Same idempotence rule for the disk: re-creating it would destroy the installed Ubuntu.
     if !cfg.disk_path.exists() {
         let status = Command::new("qemu-img")
             .args([
@@ -165,6 +187,7 @@ fn init() -> Result<(), String> {
                     .ok_or("disk path contains invalid UTF-8")?,
                 &cfg.disk_size,
             ])
+            // status() waits for qemu-img, which only writes a small qcow2 header, so it returns quickly.
             .status()
             .map_err(|e| format!("run qemu-img: {e}"))?;
         if !status.success() {
@@ -204,6 +227,8 @@ fn doctor() -> Result<(), String> {
     println!("/dev/kvm: {}", if Path::new("/dev/kvm").exists() { "present" } else { "missing" });
     println!("cpu virtualization flag: {}", cpu_has_vmx_or_svm());
 
+    // /dev/kvm is the single most common failure; without it QEMU silently falls back to slow
+    // software emulation (see qemu_args), so spell out the fix instead of just printing "missing".
     // Provide actionable mitigation guidance if hardware virtualization acceleration is inaccessible
     if !Path::new("/dev/kvm").exists() {
         println!();
@@ -221,11 +246,14 @@ fn install(iso: &Path) -> Result<(), String> {
     if !iso.exists() {
         return Err(format!("ISO not found: {}", iso.display()));
     }
+    // Check the ISO before ensure_initialized so a typo does not create the config and a 60G disk first.
     ensure_initialized()?;
     launch(true, Some(iso))
 }
 
 /// Boots the virtual machine in production operational mode from the installed QCOW2 virtual drive.
+///
+/// The `_from_gui` flag is currently unused (underscore-prefixed on purpose); every caller passes `false`.
 fn run(_from_gui: bool) -> Result<(), String> {
     ensure_initialized()?;
     launch(false, None)
@@ -241,12 +269,15 @@ fn run(_from_gui: bool) -> Result<(), String> {
 ///   - Detaches child process execution asynchronously via `Command::spawn()`.
 fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
     let cfg = load_config()?;
+    // Only a warning, never a hard stop: QEMU removes the pid file on clean exit, but a crash or
+    // power loss leaves it behind, and refusing to start would then lock the user out.
     if cfg.pid_file.exists() {
         println!("pid file exists: {}", cfg.pid_file.display());
         println!("If the VM is not actually running, remove that stale file.");
     }
 
     let args = qemu_args(&cfg, install_mode, iso)?;
+    // Echo the exact command first so a failed boot can be reproduced by hand.
     println!("starting Ubuntu VM:");
     println!("qemu-system-x86_64 {}", shell_join(&args));
 
@@ -256,6 +287,7 @@ fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
         .append(true)
         .open(&cfg.log_file)
         .map_err(|e| format!("open log file: {e}"))?;
+    // stdout and stderr need separate handles that share one file offset, hence try_clone.
     let log_err = log.try_clone().map_err(|e| format!("clone log file: {e}"))?;
 
     // Spawn QEMU process with null standard input and redirected output
@@ -264,6 +296,8 @@ fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
+        // spawn() (not status()) so vmbby returns immediately while the VM window keeps running.
+        // The Child handle is dropped without wait(); QEMU keeps running independently of vmbby.
         .spawn()
         .map_err(|e| format!("start qemu-system-x86_64: {e}"))?;
 
@@ -285,12 +319,15 @@ fn launch(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
 ///      to flush disk buffers, terminate services gracefully, and power off without data loss.
 fn stop() -> Result<(), String> {
     let cfg = load_config()?;
+    // QEMU creates the socket at startup and removes it on exit, so its absence is the cheapest
+    // "is the VM up?" test and avoids a confusing connection-refused error.
     if !cfg.qmp_socket.exists() {
         return Err(format!("QMP socket not found: {}. VM may not be running.", cfg.qmp_socket.display()));
     }
 
     let mut stream = UnixStream::connect(&cfg.qmp_socket).map_err(|e| format!("connect QMP: {e}"))?;
     stream
+        // Bound every read: a hung QEMU must not freeze `vmbby stop` forever. 2 s is ample for a local socket.
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("set QMP timeout: {e}"))?;
     
@@ -303,6 +340,8 @@ fn stop() -> Result<(), String> {
         .map_err(|e| format!("send qmp_capabilities: {e}"))?;
     let _ = read_some(&mut stream);
     
+    // The reply to system_powerdown is not read: success means "request delivered", and the guest
+    // OS decides when (and whether) to shut down, which can take many seconds.
     // Dispatch ACPI system powerdown command
     stream
         .write_all(b"{\"execute\":\"system_powerdown\"}\n")
@@ -319,6 +358,7 @@ fn status() -> Result<(), String> {
     println!("qmp: {}", cfg.qmp_socket.display());
     println!("pid file: {}", cfg.pid_file.display());
     println!("log: {}", cfg.log_file.display());
+    // Heuristic only: the socket can outlive a crashed QEMU, hence "probably".
     println!("vm state: {}", if cfg.qmp_socket.exists() { "probably running" } else { "not running or no QMP socket" });
     Ok(())
 }
@@ -327,6 +367,7 @@ fn status() -> Result<(), String> {
 /// 
 /// Memory Efficiency: Collects lines in memory and uses saturating subtraction to prevent underflow.
 fn logs() -> Result<(), String> {
+    // Falls back to defaults so `logs` works even before a config file exists.
     let cfg = load_config().unwrap_or(default_config()?);
     if !cfg.log_file.exists() {
         println!("no log yet: {}", cfg.log_file.display());
@@ -335,6 +376,7 @@ fn logs() -> Result<(), String> {
     let text = fs::read_to_string(&cfg.log_file)
         .map_err(|e| format!("read {}: {e}", cfg.log_file.display()))?;
     let lines: Vec<&str> = text.lines().collect();
+    // 160 lines is roughly two terminal screens: enough context for a failed boot without flooding the shell.
     let start = lines.len().saturating_sub(160);
     for line in &lines[start..] {
         println!("{line}");
@@ -348,6 +390,7 @@ fn gui() -> Result<(), String> {
     if !helper.exists() {
         return Err(format!("GUI helper missing: {}", helper.display()));
     }
+    // Spawned and not waited on: the GTK window is long-lived and vmbby should return the prompt.
     Command::new("python3")
         .arg(helper)
         .spawn()
@@ -363,6 +406,8 @@ fn gui() -> Result<(), String> {
 ///   3. User XDG data directory `~/.local/share/vmbby/assets/vmbby_controller.py` (user installation).
 ///   4. Global system data directory `/usr/share/vmbby/assets/vmbby_controller.py` (system packages).
 fn gui_helper_path() -> Result<PathBuf, String> {
+    // The search order goes from "developer checkout" to "installed package", so a local edit of the
+    // script always wins over a system copy.
     let name = Path::new("assets").join("vmbby_controller.py");
     let cwd_path = env::current_dir()
         .map_err(|e| format!("current dir: {e}"))?
@@ -389,6 +434,7 @@ fn gui_helper_path() -> Result<PathBuf, String> {
         return Ok(user_data);
     }
 
+    // Last resort: returned even if it does not exist; the caller (gui) reports "GUI helper missing" with this path.
     Ok(PathBuf::from("/usr/share/vmbby/assets/vmbby_controller.py"))
 }
 
@@ -471,7 +517,11 @@ fn print_command(install_mode: bool, iso: Option<&Path>) -> Result<(), String> {
 ///   - Display & Input: GTK3/GTK4 frontend with VirtIO-VGA accelerated framebuffer and USB XHCI tablet pointer.
 ///   - Telemetry IPC: QMP JSON-RPC socket server and process ID lockfile.
 fn qemu_args(cfg: &VmConfig, install_mode: bool, iso: Option<&Path>) -> Result<Vec<OsString>, String> {
+    // KVM decides the whole CPU strategy: with it the guest runs at near-native speed; without it
+    // QEMU's TCG software emulation works but is many times slower.
     let kvm = Path::new("/dev/kvm").exists();
+    // Flags are pushed as separate OsStrings (not one string) so paths with spaces survive without
+    // shell quoting; shell_join only quotes for *display*.
     let mut args = vec![
         "-name".into(),
         cfg.name.clone().into(),
@@ -489,6 +539,7 @@ fn qemu_args(cfg: &VmConfig, install_mode: bool, iso: Option<&Path>) -> Result<V
         "user,id=net0".into(),
         "-device".into(),
         "virtio-net-pci,netdev=net0".into(),
+        // gl=off avoids host OpenGL/Wayland driver problems; virtio-vga then renders in software.
         "-display".into(),
         "gtk,gl=off".into(),
         "-device".into(),
@@ -497,14 +548,18 @@ fn qemu_args(cfg: &VmConfig, install_mode: bool, iso: Option<&Path>) -> Result<V
         "qemu-xhci".into(),
         "-device".into(),
         "usb-tablet".into(),
+        // server=on,wait=off: QEMU listens on the socket but boots without waiting for a client.
+        // This is the socket `vmbby stop` connects to.
         "-qmp".into(),
         format!("unix:{},server=on,wait=off", cfg.qmp_socket.display()).into(),
+        // Lets `launch` detect a previous instance; QEMU deletes it on clean exit.
         "-pidfile".into(),
         cfg.pid_file.as_os_str().into(),
     ];
 
     // Conditionally append optical media drive flags during installation boot
     if install_mode {
+        // Internal consistency check: callers always pass an ISO in install mode, so this guards future misuse.
         let iso = iso.ok_or("install mode requires an ISO path")?;
         args.push("-cdrom".into());
         args.push(iso.as_os_str().into());
@@ -525,6 +580,8 @@ fn ensure_initialized() -> Result<(), String> {
 
 /// Generates the default VmConfig initialized to standardized paths under XDG Base Directories.
 fn default_config() -> Result<VmConfig, String> {
+    // Disk and log are durable (data dir); socket and pid file are transient (runtime dir, wiped on
+    // logout/reboot), which is exactly why stale pid files are possible.
     let data = data_dir()?;
     let run = run_dir()?;
     Ok(VmConfig {
@@ -541,6 +598,8 @@ fn default_config() -> Result<VmConfig, String> {
 
 /// Serializes a VmConfig struct into key-value INI configuration file format.
 fn render_config(cfg: &VmConfig) -> String {
+    // Plain `key=value` lines (no sections, no quoting) keep the parser in load_config trivial and
+    // let users edit the file by hand. Keys here must match the match arms in load_config.
     format!(
         "name={}\nram={}\ncpus={}\ndisk_size={}\ndisk_path={}\nqmp_socket={}\npid_file={}\nlog_file={}\n",
         cfg.name,
@@ -556,14 +615,17 @@ fn render_config(cfg: &VmConfig) -> String {
 
 /// Deserializes INI configuration file from disk, expanding home tildes and overriding defaults.
 fn load_config() -> Result<VmConfig, String> {
+    // Start from defaults so a config file missing a key (or an older file) still yields a full config.
     let mut cfg = default_config()?;
     let path = config_path()?;
     let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     for line in text.lines() {
         let trimmed = line.trim();
+        // Blank lines and `#` comments are skipped so users can annotate their config.
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        // split_once keeps any further '=' inside the value (paths may contain them); lines with no '=' are ignored.
         let Some((key, value)) = trimmed.split_once('=') else {
             continue;
         };
@@ -572,10 +634,12 @@ fn load_config() -> Result<VmConfig, String> {
             "ram" => cfg.ram = value.into(),
             "cpus" => cfg.cpus = value.into(),
             "disk_size" => cfg.disk_size = value.into(),
+            // Only path-valued keys get `~/` expansion; size/name strings are passed to QEMU as-is.
             "disk_path" => cfg.disk_path = expand_home(value),
             "qmp_socket" => cfg.qmp_socket = expand_home(value),
             "pid_file" => cfg.pid_file = expand_home(value),
             "log_file" => cfg.log_file = expand_home(value),
+            // Unknown keys are ignored for forward compatibility with newer config files.
             _ => {}
         }
     }
@@ -599,6 +663,8 @@ fn data_dir() -> Result<PathBuf, String> {
 
 /// Returns runtime transient socket directory: `$XDG_RUNTIME_DIR/vmbby`.
 fn run_dir() -> Result<PathBuf, String> {
+    // XDG_RUNTIME_DIR (e.g. /run/user/1000) is private to the user and tmpfs-backed; /tmp is only a
+    // fallback for odd sessions and is world-writable, so the socket there is less well protected.
     let base = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -628,6 +694,8 @@ fn home_dir() -> Result<PathBuf, String> {
 
 /// Performs safe tilde expansion for paths beginning with `~/`.
 fn expand_home(value: &str) -> PathBuf {
+    // Shells expand `~` but a config file is not read by a shell, so it is done here. Only the
+    // leading `~/` form is supported (not `~user`).
     if let Some(rest) = value.strip_prefix("~/") {
         if let Ok(home) = home_dir() {
             return home.join(rest);
@@ -638,6 +706,8 @@ fn expand_home(value: &str) -> PathBuf {
 
 /// Tests for the existence of an executable binary on system `$PATH` via POSIX shell `command -v`.
 fn found(bin: &str) -> &'static str {
+    // `command -v` is a shell builtin (there is no portable `which` binary), so go through `sh -c`.
+    // `bin` is always a hard-coded name from doctor(), never user input, so interpolating it is safe.
     if Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {bin} >/dev/null 2>&1"))
@@ -654,6 +724,8 @@ fn found(bin: &str) -> &'static str {
 /// Inspects `/proc/cpuinfo` to detect Intel VMX or AMD SVM hardware virtualization extensions.
 fn cpu_has_vmx_or_svm() -> &'static str {
     match fs::read_to_string("/proc/cpuinfo") {
+        // Flags are space-separated in the "flags" line; the surrounding spaces avoid matching longer
+        // flag names that merely contain "vmx"/"svm". vmx = Intel VT-x, svm = AMD-V.
         Ok(text) if text.contains(" vmx ") || text.contains(" svm ") => "present",
         Ok(_) => "missing",
         Err(_) => "unknown",
@@ -667,6 +739,8 @@ fn read_trimmed(path: &str) -> Option<String> {
 
 /// Reads available bytes from a UNIX domain stream into a 4096-byte stack buffer.
 fn read_some(stream: &mut UnixStream) -> String {
+    // One read is enough for QMP's short greeting/ack lines; errors and timeouts become an empty string
+    // because the caller only uses this to drain the socket, not to inspect the reply.
     let mut buf = [0_u8; 4096];
     match stream.read(&mut buf) {
         Ok(n) => String::from_utf8_lossy(&buf[..n]).to_string(),
@@ -684,9 +758,11 @@ fn shell_join(args: &[OsString]) -> String {
 
 /// Quotes a command string for safe shell interpolation, escaping inner single quotes.
 fn shell_quote(s: &str) -> String {
+    // Fast path: strings made only of these "safe" characters need no quotes, keeping the printed command readable.
     if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,+".contains(c)) {
         s.to_string()
     } else {
+        // POSIX single-quote escaping: end the quote, add an escaped quote, reopen the quote (' -> '\'').
         format!("'{}'", s.replace('\'', "'\\''"))
     }
 }

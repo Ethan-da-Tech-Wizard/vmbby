@@ -1,6 +1,8 @@
+# Package identity. vmbby is a single binary crate (src/main.rs).
 [package]
 name = "vmbby"
 version = "0.1.0"
 edition = "2024"
 
+# Deliberately empty: vmbby uses only the standard library, so there is nothing to audit or update.
 [dependencies]
